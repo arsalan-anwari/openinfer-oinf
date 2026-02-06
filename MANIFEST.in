@@ -1,0 +1,3 @@
+recursive-exclude examples *
+recursive-exclude res *
+recursive-exclude tests *

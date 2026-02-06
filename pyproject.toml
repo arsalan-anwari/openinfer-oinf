@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openinfer-oinf"
+version = "0.1.0"
+description = "Python tooling for the .oinf model format."
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = ["pydantic", "numpy"]
+
+[tool.setuptools]
+py-modules = [
+  "dataclass_to_oinf",
+  "oinf_common",
+  "oinf_encoder",
+  "oinf_format",
+  "oinf_numeric",
+  "oinf_packed",
+  "oinf_types",
+  "oinf_verify",
+  "verify_oinf",
+]
