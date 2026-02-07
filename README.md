@@ -26,4 +26,4 @@ python verify_oinf.py res/models/mlp_regression.oinf
 python tests/run_oinf_tests.py
 ```
 
-Docs: https://github.com/arsalan-awnari/openinfer/tree/main/docs/sphinx/modules/openinfer-oinf
+Docs: docs.open-infer.nl
