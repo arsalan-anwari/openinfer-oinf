@@ -137,6 +137,86 @@ def _parse_metadata_value(blob: bytes, entry: Dict[str, Any]) -> Any:
     raise OinfError(f"Unsupported metadata value type {vtype}")
 
 
+def _parse_quant_payload(blob: bytes, tensor: Dict[str, Any], offset_data: int, file_size: int) -> Dict[str, Any]:
+    """Parse and validate tensor quant payload."""
+    q_offset = tensor["quant_offset"]
+    q_nbytes = tensor["quant_nbytes"]
+    if q_offset % 8 != 0:
+        raise OinfError("Tensor quant offset not aligned")
+    if q_offset < offset_data:
+        raise OinfError("Tensor quant offset precedes data section")
+    if q_offset + q_nbytes > file_size:
+        raise OinfError("Tensor quant payload exceeds file size")
+    if q_nbytes < 48:
+        raise OinfError("Tensor quant payload too small")
+    payload = blob[q_offset : q_offset + q_nbytes]
+
+    scheme, scale_mode, zp_mode, reserved, scale_axis, scale_count, zp_axis, zp_count = struct.unpack_from(
+        "<IIIIQQQQ", payload, 0
+    )
+    if reserved != 0:
+        raise OinfError("Tensor quant reserved must be 0")
+    if scheme not in (1, 2):
+        raise OinfError("Tensor quant scheme invalid")
+    if scale_mode not in (1, 2):
+        raise OinfError("Tensor quant scale mode invalid")
+    if zp_mode not in (0, 1, 2):
+        raise OinfError("Tensor quant zero_point mode invalid")
+
+    scale_bytes = scale_count * 4
+    zp_bytes = zp_count * 4
+    expected = align_up(48 + scale_bytes + zp_bytes)
+    if q_nbytes != expected:
+        raise OinfError("Tensor quant payload size mismatch")
+    scale_start = 48
+    scale_end = scale_start + scale_bytes
+    zp_end = scale_end + zp_bytes
+    scale_values = np.frombuffer(payload[scale_start:scale_end], dtype=np.dtype(np.float32).newbyteorder("<"))
+    zp_values = np.frombuffer(payload[scale_end:zp_end], dtype=np.dtype(np.int32).newbyteorder("<"))
+
+    dims = tensor["dims"]
+    ndim = tensor["ndim"]
+    if scale_mode == 1:
+        if scale_axis != 0 or scale_count != 1:
+            raise OinfError("Per-tensor scale must use axis=0 and count=1")
+    else:
+        if scale_axis >= ndim:
+            raise OinfError("Per-channel scale axis out of range")
+        if scale_count != dims[scale_axis]:
+            raise OinfError("Per-channel scale count mismatch")
+
+    if zp_mode == 0:
+        if zp_count != 0:
+            raise OinfError("No-zero-point mode requires count=0")
+    elif zp_mode == 1:
+        if scale_mode != 1:
+            raise OinfError("Per-tensor zero-point requires per-tensor scale")
+        if zp_axis != 0 or zp_count != 1:
+            raise OinfError("Per-tensor zero-point must use axis=0 and count=1")
+    else:
+        if scale_mode != 2:
+            raise OinfError("Per-channel zero-point requires per-channel scale")
+        if zp_axis != scale_axis:
+            raise OinfError("Per-channel zero-point axis must match scale axis")
+        if zp_axis >= ndim:
+            raise OinfError("Per-channel zero-point axis out of range")
+        if zp_count != dims[zp_axis]:
+            raise OinfError("Per-channel zero-point count mismatch")
+
+    if scheme == 1 and zp_mode != 0:
+        raise OinfError("Symmetric quantization cannot include zero_point")
+
+    return {
+        "scheme": "symmetric" if scheme == 1 else "asymmetric",
+        "scale_mode": "per_tensor" if scale_mode == 1 else "per_channel",
+        "scale_axis": int(scale_axis),
+        "scale_values": scale_values,
+        "zero_point_mode": {0: "none", 1: "per_tensor", 2: "per_channel"}[zp_mode],
+        "zero_point_axis": int(zp_axis),
+        "zero_point_values": zp_values,
+    }
+
+
 def parse_file(path: str) -> None:
     """Parse and print validation output for a .oinf file."""
     with open(path, "rb") as handle:
@@ -149,7 +229,7 @@ def parse_file(path: str) -> None:
     if magic != b"OINF\x00":
         raise OinfError("Bad magic")
     version = header[1]
-    if version != 1:
+    if version != 2:
         raise OinfError(f"Unsupported version {version}")
     n_sizevars, n_metadata, n_tensors = header[3], header[4], header[5]
     offset_sizevars, offset_metadata, offset_tensors, offset_data, file_size = header[7:]
@@ -227,9 +307,12 @@ def parse_file(path: str) -> None:
         if ndim > 0:
             dims = struct.unpack_from("<" + "Q" * ndim, blob, cursor)
             cursor += 8 * ndim
-        data_nbytes, data_offset = struct.unpack_from("<QQ", blob, cursor)
-        cursor += 16
+        data_nbytes, data_offset, quant_nbytes, quant_offset = struct.unpack_from("<QQQQ", blob, cursor)
+        cursor += 32
         has_data = flags & 1
+        has_quant = (flags & 2) != 0
+        if flags & ~0x3:
+            raise OinfError("Tensor flags contain unsupported bits")
         if not has_data:
             if data_nbytes != 0 or data_offset != 0:
                 raise OinfError("Tensor without data must have zero offset/size")
@@ -244,6 +327,16 @@ def parse_file(path: str) -> None:
                 raise OinfError("Tensor data_nbytes mismatch")
             if data_offset + data_nbytes > file_size:
                 raise OinfError("Tensor data exceeds file size")
+        if not has_quant:
+            if quant_nbytes != 0 or quant_offset != 0:
+                raise OinfError("Tensor without quant must have zero quant offset/size")
+        else:
+            if quant_offset % 8 != 0:
+                raise OinfError("Tensor quant offset not aligned")
+            if quant_offset < offset_data:
+                raise OinfError("Tensor quant offset precedes data section")
+            if quant_offset + quant_nbytes > file_size:
+                raise OinfError("Tensor quant payload exceeds file size")
         tensors.append(
             {
                 "name": name,
@@ -253,6 +346,9 @@ def parse_file(path: str) -> None:
                 "has_data": bool(has_data),
                 "data_nbytes": data_nbytes,
                 "data_offset": data_offset,
+                "has_quant": bool(has_quant),
+                "quant_nbytes": quant_nbytes,
+                "quant_offset": quant_offset,
             }
         )
 
@@ -338,9 +434,39 @@ def parse_file(path: str) -> None:
                 f"mean: {stats['mean']:.6g}, median: {stats['median']:.6g}, std: {stats['std']:.6g}]"
             )
             print(f"- hist: {histogram_string(arr)}")
+            if tensor["has_quant"]:
+                quant = _parse_quant_payload(blob, tensor, offset_data, file_size)
+                scale_vals = quant["scale_values"]
+                if quant["scale_mode"] == "per_tensor":
+                    scale_desc = f"per_tensor({float(scale_vals[0]):.6g})"
+                else:
+                    scale_desc = f"per_channel(axis={quant['scale_axis']}, count={len(scale_vals)})"
+                zp_vals = quant["zero_point_values"]
+                if quant["zero_point_mode"] == "none":
+                    zp_desc = "none"
+                elif quant["zero_point_mode"] == "per_tensor":
+                    zp_desc = f"per_tensor({int(zp_vals[0])})"
+                else:
+                    zp_desc = f"per_channel(axis={quant['zero_point_axis']}, count={len(zp_vals)})"
+                print(f"- quant: scheme={quant['scheme']}, scale={scale_desc}, zero_point={zp_desc}")
             print()
         else:
             print(f"{name}: {dtype}[{dims}] -- uninitialized")
+            if tensor["has_quant"]:
+                quant = _parse_quant_payload(blob, tensor, offset_data, file_size)
+                scale_vals = quant["scale_values"]
+                if quant["scale_mode"] == "per_tensor":
+                    scale_desc = f"per_tensor({float(scale_vals[0]):.6g})"
+                else:
+                    scale_desc = f"per_channel(axis={quant['scale_axis']}, count={len(scale_vals)})"
+                zp_vals = quant["zero_point_values"]
+                if quant["zero_point_mode"] == "none":
+                    zp_desc = "none"
+                elif quant["zero_point_mode"] == "per_tensor":
+                    zp_desc = f"per_tensor({int(zp_vals[0])})"
+                else:
+                    zp_desc = f"per_channel(axis={quant['zero_point_axis']}, count={len(zp_vals)})"
+                print(f"- quant: scheme={quant['scheme']}, scale={scale_desc}, zero_point={zp_desc}")
             print()
 
 
