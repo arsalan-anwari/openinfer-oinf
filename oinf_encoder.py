@@ -65,11 +65,67 @@ class TensorSpec:
         data: Union[np.ndarray, Sequence[Any]],
         dtype: Optional[Union[str, int]] = None,
         name: Optional[str] = None,
+        quant: Optional["QuantParams"] = None,
     ):
         """Define a tensor with optional dtype override and name."""
         self.data = data
         self.dtype = dtype
         self.name = name
+        self.quant = quant
+
+
+class QuantScale:
+    """Quantization scale definition."""
+
+    PER_TENSOR = 1
+    PER_CHANNEL = 2
+
+    def __init__(self, mode: int, value: Optional[float] = None, axis: Optional[int] = None, values: Optional[Sequence[float]] = None):
+        self.mode = int(mode)
+        self.value = float(value) if value is not None else None
+        self.axis = int(axis) if axis is not None else None
+        self.values = [float(v) for v in values] if values is not None else None
+
+    @staticmethod
+    def per_tensor(value: float) -> "QuantScale":
+        return QuantScale(QuantScale.PER_TENSOR, value=value)
+
+    @staticmethod
+    def per_channel(axis: int, values: Sequence[float]) -> "QuantScale":
+        return QuantScale(QuantScale.PER_CHANNEL, axis=axis, values=values)
+
+
+class QuantZeroPoint:
+    """Quantization zero-point definition."""
+
+    PER_TENSOR = 1
+    PER_CHANNEL = 2
+
+    def __init__(self, mode: int, value: Optional[int] = None, axis: Optional[int] = None, values: Optional[Sequence[int]] = None):
+        self.mode = int(mode)
+        self.value = int(value) if value is not None else None
+        self.axis = int(axis) if axis is not None else None
+        self.values = [int(v) for v in values] if values is not None else None
+
+    @staticmethod
+    def per_tensor(value: int) -> "QuantZeroPoint":
+        return QuantZeroPoint(QuantZeroPoint.PER_TENSOR, value=value)
+
+    @staticmethod
+    def per_channel(axis: int, values: Sequence[int]) -> "QuantZeroPoint":
+        return QuantZeroPoint(QuantZeroPoint.PER_CHANNEL, axis=axis, values=values)
+
+
+class QuantParams:
+    """Tensor quantization parameters."""
+
+    SYMMETRIC = "symmetric"
+    ASYMMETRIC = "asymmetric"
+
+    def __init__(self, scheme: str, scale: QuantScale, zero_point: Optional[QuantZeroPoint] = None):
+        self.scheme = str(scheme).strip().lower()
+        self.scale = scale
+        self.zero_point = zero_point
 
 
 class ScalarValue:
@@ -482,28 +538,129 @@ def _encode_tensor_payload(
     return dtype, tuple(int(d) for d in arr.shape), data
 
 
-def _encode_tensor(name: str, value: Any, meta: Dict[str, Any]) -> Tuple[str, int, Tuple[int, ...], int, Optional[bytes]]:
+def _validate_and_encode_quant(
+    tensor_name: str,
+    dims: Tuple[int, ...],
+    quant: Optional[QuantParams],
+) -> Optional[bytes]:
+    if quant is None:
+        return None
+    if not isinstance(quant, QuantParams):
+        raise OinfError(f"Tensor '{tensor_name}' quant must be QuantParams")
+    if not isinstance(quant.scale, QuantScale):
+        raise OinfError(f"Tensor '{tensor_name}' quant.scale must be QuantScale")
+
+    if quant.scheme == QuantParams.SYMMETRIC:
+        scheme_code = 1
+    elif quant.scheme == QuantParams.ASYMMETRIC:
+        scheme_code = 2
+    else:
+        raise OinfError(f"Tensor '{tensor_name}' quant scheme must be symmetric or asymmetric")
+
+    if quant.scale.mode == QuantScale.PER_TENSOR:
+        if quant.scale.value is None:
+            raise OinfError(f"Tensor '{tensor_name}' per-tensor scale requires a value")
+        scale_axis = 0
+        scale_values = [float(quant.scale.value)]
+    elif quant.scale.mode == QuantScale.PER_CHANNEL:
+        if quant.scale.axis is None or quant.scale.values is None:
+            raise OinfError(f"Tensor '{tensor_name}' per-channel scale requires axis and values")
+        if quant.scale.axis < 0 or quant.scale.axis >= len(dims):
+            raise OinfError(f"Tensor '{tensor_name}' per-channel scale axis out of range")
+        expected = dims[quant.scale.axis]
+        if expected != len(quant.scale.values):
+            raise OinfError(
+                f"Tensor '{tensor_name}' per-channel scale length mismatch: expected {expected}, got {len(quant.scale.values)}"
+            )
+        scale_axis = int(quant.scale.axis)
+        scale_values = [float(v) for v in quant.scale.values]
+    else:
+        raise OinfError(f"Tensor '{tensor_name}' scale mode must be per-tensor or per-channel")
+
+    zp_mode = 0
+    zp_axis = 0
+    zp_values: List[int] = []
+    if quant.zero_point is not None:
+        if not isinstance(quant.zero_point, QuantZeroPoint):
+            raise OinfError(f"Tensor '{tensor_name}' quant.zero_point must be QuantZeroPoint")
+        if scheme_code == 1:
+            raise OinfError(f"Tensor '{tensor_name}' symmetric quantization does not support zero_point")
+        if quant.zero_point.mode == QuantZeroPoint.PER_TENSOR:
+            if quant.scale.mode != QuantScale.PER_TENSOR:
+                raise OinfError(f"Tensor '{tensor_name}' per-tensor zero_point requires per-tensor scale")
+            if quant.zero_point.value is None:
+                raise OinfError(f"Tensor '{tensor_name}' per-tensor zero_point requires a value")
+            zp_mode = 1
+            zp_values = [int(quant.zero_point.value)]
+        elif quant.zero_point.mode == QuantZeroPoint.PER_CHANNEL:
+            if quant.scale.mode != QuantScale.PER_CHANNEL:
+                raise OinfError(f"Tensor '{tensor_name}' per-channel zero_point requires per-channel scale")
+            if quant.zero_point.axis is None or quant.zero_point.values is None:
+                raise OinfError(f"Tensor '{tensor_name}' per-channel zero_point requires axis and values")
+            if int(quant.zero_point.axis) != scale_axis:
+                raise OinfError(f"Tensor '{tensor_name}' zero_point axis must match scale axis")
+            expected = dims[int(quant.zero_point.axis)]
+            if expected != len(quant.zero_point.values):
+                raise OinfError(
+                    f"Tensor '{tensor_name}' per-channel zero_point length mismatch: expected {expected}, got {len(quant.zero_point.values)}"
+                )
+            zp_mode = 2
+            zp_axis = int(quant.zero_point.axis)
+            zp_values = [int(v) for v in quant.zero_point.values]
+        else:
+            raise OinfError(f"Tensor '{tensor_name}' zero_point mode must be per-tensor or per-channel")
+
+    header = struct.pack(
+        "<IIIIQQQQ",
+        scheme_code,
+        1 if quant.scale.mode == QuantScale.PER_TENSOR else 2,
+        zp_mode,
+        0,
+        int(scale_axis),
+        len(scale_values),
+        int(zp_axis),
+        len(zp_values),
+    )
+    scale_raw = np.array(scale_values, dtype=np.float32).astype(np.dtype(np.float32).newbyteorder("<")).tobytes()
+    zp_raw = (
+        np.array(zp_values, dtype=np.int32).astype(np.dtype(np.int32).newbyteorder("<")).tobytes()
+        if zp_values
+        else b""
+    )
+    payload = header + scale_raw + zp_raw
+    padding = b"\x00" * (align_up(len(payload)) - len(payload))
+    return payload + padding
+
+
+def _encode_tensor(
+    name: str,
+    value: Any,
+    meta: Dict[str, Any],
+) -> Tuple[str, int, Tuple[int, ...], int, Optional[bytes], int, Optional[bytes]]:
     tensor_name = name
     if isinstance(value, TensorSpec):
         if value.name:
             tensor_name = value.name
         dtype_override = _resolve_dtype(value.data, {"dtype": value.dtype} if value.dtype else {})
         dtype, shape, data = _encode_tensor_payload(value.data, dtype_override)
-        return tensor_name, dtype, shape, 1, data
+        quant_payload = _validate_and_encode_quant(tensor_name, shape, value.quant)
+        return tensor_name, dtype, shape, 1, data, 1 if quant_payload is not None else 0, quant_payload
     if isinstance(value, UninitializedTensor):
         if value.name:
             tensor_name = value.name
         dtype = dtype_from_alias(value.dtype) if isinstance(value.dtype, str) else int(value.dtype)
         if dtype not in VT_TO_DTYPE:
             raise OinfError(f"Unsupported tensor dtype for '{tensor_name}'")
-        return tensor_name, dtype, tuple(int(d) for d in value.shape), 0, None
+        return tensor_name, dtype, tuple(int(d) for d in value.shape), 0, None, 0, None
     if isinstance(value, np.ndarray):
         dtype, shape, data = _encode_tensor_payload(value, None)
-        return tensor_name, dtype, shape, 1, data
+        quant_payload = _validate_and_encode_quant(tensor_name, shape, None)
+        return tensor_name, dtype, shape, 1, data, 0 if quant_payload is None else 1, quant_payload
     if isinstance(value, (list, tuple)):
         dtype_override = _resolve_dtype(value, meta)
         dtype, shape, data = _encode_tensor_payload(value, dtype_override)
-        return tensor_name, dtype, shape, 1, data
+        quant_payload = _validate_and_encode_quant(tensor_name, shape, None)
+        return tensor_name, dtype, shape, 1, data, 0 if quant_payload is None else 1, quant_payload
     if value is None:
         dtype_override = _resolve_dtype(value, meta)
         if dtype_override is None:
@@ -511,7 +668,7 @@ def _encode_tensor(name: str, value: Any, meta: Dict[str, Any]) -> Tuple[str, in
         shape = meta.get("shape")
         if shape is None:
             raise OinfError(f"Tensor '{tensor_name}' is None but no shape provided")
-        return tensor_name, dtype_override, tuple(int(d) for d in shape), 0, None
+        return tensor_name, dtype_override, tuple(int(d) for d in shape), 0, None, 0, None
     raise OinfError(f"Unsupported tensor type for '{tensor_name}': {type(value)}")
 
 
@@ -536,18 +693,22 @@ def _build_metadata_table(
 
 
 def _build_tensor_table(
-    tensors: List[Tuple[str, int, Tuple[int, ...], int, Optional[bytes]]],
-    offsets: Optional[List[int]] = None,
+    tensors: List[Tuple[str, int, Tuple[int, ...], int, Optional[bytes], int, Optional[bytes]]],
+    data_offsets: Optional[List[int]] = None,
+    quant_offsets: Optional[List[int]] = None,
 ) -> bytes:
     parts = []
-    for idx, (name, dtype, dims, has_data, payload) in enumerate(tensors):
-        offset = offsets[idx] if offsets is not None else 0
+    for idx, (name, dtype, dims, has_data, payload, has_quant, quant_payload) in enumerate(tensors):
+        data_offset = data_offsets[idx] if data_offsets is not None else 0
+        quant_offset = quant_offsets[idx] if quant_offsets is not None else 0
         data_nbytes = 0 if payload is None else len(payload)
+        quant_nbytes = 0 if quant_payload is None else len(quant_payload)
         parts.append(encode_string(name))
-        parts.append(struct.pack("<III", dtype, len(dims), has_data))
+        flags = (1 if has_data else 0) | (2 if has_quant else 0)
+        parts.append(struct.pack("<III", dtype, len(dims), flags))
         if dims:
             parts.append(struct.pack("<" + "Q" * len(dims), *dims))
-        parts.append(struct.pack("<QQ", data_nbytes, offset))
+        parts.append(struct.pack("<QQQQ", data_nbytes, data_offset, quant_nbytes, quant_offset))
     return b"".join(parts)
 
 
@@ -561,7 +722,7 @@ def _encode_oinf(
     for key, (value, meta) in sorted(metadata.items(), key=lambda kv: kv[0]):
         payload_type, payload = _encode_metadata_payload(value, meta)
         metadata_entries.append((key, payload_type, payload))
-    tensor_entries: List[Tuple[str, int, Tuple[int, ...], int, Optional[bytes]]] = []
+    tensor_entries: List[Tuple[str, int, Tuple[int, ...], int, Optional[bytes], int, Optional[bytes]]] = []
     for name, (value, meta) in sorted(tensors.items(), key=lambda kv: kv[0]):
         tensor_entries.append(_encode_tensor(name, value, meta))
 
@@ -586,7 +747,9 @@ def _encode_oinf(
 
     tensor_offsets: List[int] = []
     tensor_blobs: List[bytes] = []
-    for _, _, _, has_data, payload in tensor_entries:
+    quant_offsets: List[int] = []
+    quant_blobs: List[bytes] = []
+    for _, _, _, has_data, payload, has_quant, quant_payload in tensor_entries:
         if has_data:
             tensor_offsets.append(data_cursor)
             tensor_blobs.append(payload or b"")
@@ -594,15 +757,22 @@ def _encode_oinf(
         else:
             tensor_offsets.append(0)
             tensor_blobs.append(b"")
+        if has_quant:
+            quant_offsets.append(data_cursor)
+            quant_blobs.append(quant_payload or b"")
+            data_cursor += align_up(len(quant_payload or b""))
+        else:
+            quant_offsets.append(0)
+            quant_blobs.append(b"")
 
     metadata_table = _build_metadata_table(metadata_entries, metadata_offsets)
-    tensor_table = _build_tensor_table(tensor_entries, tensor_offsets)
+    tensor_table = _build_tensor_table(tensor_entries, tensor_offsets, quant_offsets)
 
     file_size = data_cursor
     header = struct.pack(
         "<5sIIIIIIQQQQQ",
         b"OINF\x00",
-        1,
+        2,
         0,
         len(sizevars_list),
         len(metadata_entries),
@@ -629,6 +799,11 @@ def _encode_oinf(
         output += payload
         output += b"\x00" * (align_up(len(payload)) - len(payload))
     for payload, offset in zip(tensor_blobs, tensor_offsets):
+        if offset == 0:
+            continue
+        output += payload
+        output += b"\x00" * (align_up(len(payload)) - len(payload))
+    for payload, offset in zip(quant_blobs, quant_offsets):
         if offset == 0:
             continue
         output += payload

@@ -14,7 +14,14 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from dataclass_to_oinf import SizeVar, TensorSpec, write_oinf  # noqa: E402
+from dataclass_to_oinf import (  # noqa: E402
+    QuantParams,
+    QuantScale,
+    QuantZeroPoint,
+    SizeVar,
+    TensorSpec,
+    write_oinf,
+)
 
 
 @dataclass
@@ -35,8 +42,24 @@ def build_model() -> QuantizedLinearModel:
         B=SizeVar(B),
         D=SizeVar(D),
         O=SizeVar(O),
-        x=TensorSpec(x, dtype="i4"),
-        w=TensorSpec(w, dtype="i4"),
+        x=TensorSpec(
+            x,
+            dtype="i4",
+            quant=QuantParams(
+                scheme="asymmetric",
+                scale=QuantScale.per_tensor(0.125),
+                zero_point=QuantZeroPoint.per_tensor(0),
+            ),
+        ),
+        w=TensorSpec(
+            w,
+            dtype="i4",
+            quant=QuantParams(
+                scheme="symmetric",
+                scale=QuantScale.per_channel(axis=0, values=np.full((D,), 0.0625, dtype=np.float32)),
+                zero_point=None,
+            ),
+        ),
     )
 
 
